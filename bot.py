@@ -13,8 +13,16 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BACKEND_URL = os.environ.get("BACKEND_URL", "https://youtube-production-a411.up.railway.app")
 
-# YouTube URL regex
 YT_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/(watch\?v=|shorts/)?[^\s&]+")
+
+STATUS_MAP = {
+    "queued":       "⏳ Queue mein hai",
+    "downloading":  "⬇️ Video download ho rahi hai",
+    "transcribing": "🎙️ Transcript ban raha hai",
+    "analyzing":    "🤖 AI best moments dhundh raha hai",
+    "cutting":      "✂️ Clips cut ho rahi hain",
+    "uploading":    "☁️ Clips upload ho rahi hain",
+}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -37,26 +45,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def poll_job(job_id: str) -> dict:
-    """Backend se job status check karo"""
-    async with aiohttp.ClientSession() as session:
-        for _ in range(120):  # max 10 min (120 * 5s)
-            try:
-                async with session.get(
-                    f"{BACKEND_URL}/status/{job_id}", timeout=aiohttp.ClientTimeout(total=10)
-                ) as res:
-                    data = await res.json()
-                    status = data.get("status")
-                    if status in ("done", "error"):
-                        return data
-            except Exception as e:
-                logger.warning(f"Poll error: {e}")
-            await asyncio.sleep(5)
-    return {"status": "error", "error": "Timeout — 10 minute mein response nahi aaya"}
-
-
 async def send_clip(bot: Bot, chat_id: int, clip: dict, idx: int, total: int):
-    """Cloudinary se clip download karo aur Telegram pe bhejo"""
+    """Clip download karke Telegram pe bhejo"""
     clip_url = clip.get("url", "")
     reason = clip.get("reason", f"Clip {clip.get('index', idx+1)}")
     start = clip.get("start", 0)
@@ -75,11 +65,10 @@ async def send_clip(bot: Bot, chat_id: int, clip: dict, idx: int, total: int):
                     raise Exception(f"Download failed: {res.status}")
                 video_data = await res.read()
 
-        # 50MB limit check
         if len(video_data) > 49 * 1024 * 1024:
             await bot.send_message(
                 chat_id=chat_id,
-                text=f"⚠️ Clip {clip.get('index')} badi hai (>50MB) — link:\n{clip_url}",
+                text=f"⚠️ Clip {clip.get('index')} badi hai (>50MB)\nLink: {clip_url}",
             )
             return
 
@@ -95,10 +84,9 @@ async def send_clip(bot: Bot, chat_id: int, clip: dict, idx: int, total: int):
 
     except Exception as e:
         logger.error(f"Clip {idx+1} send error: {e}")
-        # Fallback — link bhejo
         await bot.send_message(
             chat_id=chat_id,
-            text=f"⚠️ Clip {clip.get('index')} send nahi ho payi — link:\n{clip_url}",
+            text=f"⚠️ Clip {clip.get('index')} send nahi hui\nLink: {clip_url}",
         )
 
 
@@ -110,20 +98,20 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not YT_REGEX.search(url):
         await update.message.reply_text(
             "❌ Yeh valid YouTube URL nahi hai!\n\n"
-            "Aisa kuch bhejo:\n`https://youtube.com/watch?v=xxxxx`",
+            "Aisa bhejo:\n`https://youtube.com/watch?v=xxxxx`",
             parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    # Processing shuru karo
+    # Sirf EK message — yahi edit hota rahega, koi naya nahi
     status_msg = await update.message.reply_text(
         "⏳ *Processing shuru ho gaya!*\n\n"
-        "🔄 Video download ho rahi hai...\n"
-        "⏱ ~5-10 min lagenge, wait karo bhai!",
+        "🔄 Backend ko request bhej raha hoon...\n"
+        "⏱ ~5-10 min lagenge, wait karo!",
         parse_mode=ParseMode.MARKDOWN
     )
 
-    # Backend ko job submit karo
+    # Job submit karo backend pe
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -136,55 +124,57 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data = await res.json()
                 job_id = data.get("job_id")
     except Exception as e:
-        await status_msg.edit_text(f"❌ Backend se connect nahi ho pa raha:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        await status_msg.edit_text(
+            f"❌ Backend se connect nahi ho pa raha\n`{e}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
-    # Progress updates bhejta raho
-    last_status = ""
-    status_map = {
-        "queued":       "⏳ Queue mein hai...",
-        "downloading":  "⬇️ Video download ho rahi hai...",
-        "transcribing": "🎙️ Transcript ban raha hai...",
-        "analyzing":    "🤖 AI best moments dhundh raha hai...",
-        "cutting":      "✂️ Clips cut ho rahi hain...",
-        "uploading":    "☁️ Clips upload ho rahi hain...",
-    }
+    # Live progress — same message edit karta rahega
+    last_text = ""
+    result = {}
 
-    async def update_progress():
-        nonlocal last_status
-        while True:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"{BACKEND_URL}/status/{job_id}",
-                        timeout=aiohttp.ClientTimeout(total=10)
-                    ) as res:
-                        d = await res.json()
-                        st = d.get("status", "")
-                        prog = d.get("progress", 0)
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{BACKEND_URL}/status/{job_id}",
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as res:
+                    d = await res.json()
+                    st = d.get("status", "")
+                    prog = d.get("progress", 0)
 
-                        if st in ("done", "error"):
-                            return d
+                    # Done ya error — loop tod do
+                    if st in ("done", "error"):
+                        result = d
+                        break
 
-                        label = status_map.get(st, f"🔄 {st}...")
-                        new_text = (
-                            f"⚙️ *Processing...*\n\n"
-                            f"{label}\n"
-                            f"📊 Progress: {prog}%"
-                        )
-                        if new_text != last_status:
-                            try:
-                                await status_msg.edit_text(new_text, parse_mode=ParseMode.MARKDOWN)
-                                last_status = new_text
-                            except Exception:
-                                pass
-            except Exception:
-                pass
-            await asyncio.sleep(5)
+                    # Progress bar bano
+                    filled = int(prog / 10)
+                    bar = "█" * filled + "░" * (10 - filled)
+                    label = STATUS_MAP.get(st, f"🔄 {st}")
 
-    # Job complete hone ka wait karo
-    result = await poll_job(job_id)
+                    new_text = (
+                        f"⚙️ *Processing...*\n\n"
+                        f"{label}...\n\n"
+                        f"`[{bar}]` {prog}%"
+                    )
 
+                    # Sirf tab edit karo jab text change hua ho
+                    if new_text != last_text:
+                        try:
+                            await status_msg.edit_text(new_text, parse_mode=ParseMode.MARKDOWN)
+                            last_text = new_text
+                        except Exception:
+                            pass
+
+        except Exception as e:
+            logger.warning(f"Poll error: {e}")
+
+        await asyncio.sleep(4)
+
+    # Error hua?
     if result.get("status") == "error":
         err = result.get("error", "Kuch gadbad ho gayi")
         await status_msg.edit_text(
@@ -198,7 +188,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("❌ Koi clip nahi bani — video check karo")
         return
 
-    # Success message
+    # Final status update
     await status_msg.edit_text(
         f"✅ *{len(clips)} Clips ready hain!*\n\n"
         f"📤 Ab ek ek karke bhej raha hoon...",
@@ -209,7 +199,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, clip in enumerate(clips):
         await bot.send_chat_action(chat_id=chat_id, action="upload_video")
         await send_clip(bot, chat_id, clip, i, len(clips))
-        await asyncio.sleep(1)  # rate limit avoid
+        await asyncio.sleep(1)
 
     await bot.send_message(
         chat_id=chat_id,
@@ -223,7 +213,6 @@ def main():
         raise ValueError("BOT_TOKEN environment variable set nahi hai!")
 
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
